@@ -7,6 +7,8 @@ for Adobe Premiere Pro editing workflows.
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox
+# Düzeltme: Drag & Drop kütüphanesi eklendi
+from tkinterdnd2 import TkinterDnD, DND_FILES 
 import threading
 import queue
 import os
@@ -19,10 +21,13 @@ from downloader_engine import DownloaderEngine, VideoJob
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-
-class YTPremiereDownloader(ctk.CTk):
+# Düzeltme: Sınıf artık DnDWrapper'ı da miras alıyor
+class YTPremiereDownloader(ctk.CTk, TkinterDnD.DnDWrapper):
     def __init__(self):
         super().__init__()
+        
+        # Düzeltme: Drag & Drop özelliğini aktifleştir
+        self.TkdndVersion = TkinterDnD._require(self)
         
         # Window configuration
         self.title("YouTube to Premiere Pro Downloader")
@@ -59,7 +64,8 @@ class YTPremiereDownloader(ctk.CTk):
         self.create_ui()
         
         # Enable drag and drop
-        self.drop_target_register(tk.DND_FILES)
+        # Düzeltme: tk.DND_FILES yerine DND_FILES kullanıldı
+        self.drop_target_register(DND_FILES)
         self.dnd_bind('<<Drop>>', self.handle_drop)
         
         # Start update loop
