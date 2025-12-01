@@ -7,12 +7,12 @@ for Adobe Premiere Pro editing workflows.
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox
-# Düzeltme: Drag & Drop kütüphanesi eklendi
 from tkinterdnd2 import TkinterDnD, DND_FILES 
 import threading
 import queue
 import os
 import sys
+import subprocess
 from pathlib import Path
 from typing import Dict, List
 from downloader_engine import DownloaderEngine, VideoJob
@@ -21,12 +21,12 @@ from downloader_engine import DownloaderEngine, VideoJob
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-# Düzeltme: Sınıf artık DnDWrapper'ı da miras alıyor
+
 class YTPremiereDownloader(ctk.CTk, TkinterDnD.DnDWrapper):
     def __init__(self):
         super().__init__()
         
-        # Düzeltme: Drag & Drop özelliğini aktifleştir
+        # Initialize Drag & Drop
         self.TkdndVersion = TkinterDnD._require(self)
         
         # Window configuration
@@ -64,9 +64,11 @@ class YTPremiereDownloader(ctk.CTk, TkinterDnD.DnDWrapper):
         self.create_ui()
         
         # Enable drag and drop
-        # Düzeltme: tk.DND_FILES yerine DND_FILES kullanıldı
-        self.drop_target_register(DND_FILES)
-        self.dnd_bind('<<Drop>>', self.handle_drop)
+        try:
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind('<<Drop>>', self.handle_drop)
+        except Exception as e:
+            print(f"⚠ Drag & Drop disabled: {e}")
         
         # Start update loop
         self.after(100, self.process_queue)
@@ -103,7 +105,7 @@ class YTPremiereDownloader(ctk.CTk, TkinterDnD.DnDWrapper):
         
         self.url_entry = ctk.CTkEntry(
             url_row,
-            placeholder_text="Paste YouTube URL here or drag & drop...",
+            placeholder_text="Paste YouTube URL here...",
             height=40
         )
         self.url_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
@@ -134,7 +136,7 @@ class YTPremiereDownloader(ctk.CTk, TkinterDnD.DnDWrapper):
         res_frame.pack(side="left", fill="x", expand=True, padx=(0, 10))
         
         ctk.CTkLabel(res_frame, text="Resolution", font=ctk.CTkFont(size=12)).pack(anchor="w")
-        self.resolution_var = tk.StringVar(value="1080p")
+        self.resolution_var = tk.StringVar(value="1080p (Full HD)")
         resolution_combo = ctk.CTkComboBox(
             res_frame,
             values=["4K (2160p)", "1080p (Full HD)", "720p (HD)"],
@@ -148,7 +150,7 @@ class YTPremiereDownloader(ctk.CTk, TkinterDnD.DnDWrapper):
         format_frame.pack(side="left", fill="x", expand=True, padx=(0, 10))
         
         ctk.CTkLabel(format_frame, text="Format Mode", font=ctk.CTkFont(size=12)).pack(anchor="w")
-        self.format_var = tk.StringVar(value="h264_cfr")
+        self.format_var = tk.StringVar(value="Pass-through (MP4/MKV)")
         format_combo = ctk.CTkComboBox(
             format_frame,
             values=[
@@ -281,7 +283,7 @@ class YTPremiereDownloader(ctk.CTk, TkinterDnD.DnDWrapper):
         
         self.start_btn = ctk.CTkButton(
             button_row,
-            text="Start Download",
+            text="Start Download (0)",
             height=40,
             font=ctk.CTkFont(size=14, weight="bold"),
             command=self.start_download
@@ -299,9 +301,10 @@ class YTPremiereDownloader(ctk.CTk, TkinterDnD.DnDWrapper):
         clear_btn.pack(side="left", padx=(0, 10))
         
         # Info footer
+        hw_info = "VideoToolbox" if self.engine.hw_encoder == "videotoolbox" else "CPU"
         info_label = ctk.CTkLabel(
             self,
-            text="FFmpeg-powered • Hardware acceleration enabled • VFR to CFR conversion",
+            text=f"FFmpeg • Hardware: {hw_info} • VFR to CFR conversion",
             font=ctk.CTkFont(size=10),
             text_color="gray40"
         )
@@ -395,7 +398,7 @@ class YTPremiereDownloader(ctk.CTk, TkinterDnD.DnDWrapper):
         
         url_label = ctk.CTkLabel(
             left_side,
-            text=job.url,
+            text=job.url[:80] + "..." if len(job.url) > 80 else job.url,
             font=ctk.CTkFont(size=10),
             text_color="gray"
         )
@@ -420,12 +423,16 @@ class YTPremiereDownloader(ctk.CTk, TkinterDnD.DnDWrapper):
     
     def handle_drop(self, event):
         """Handle drag and drop"""
-        files = self.tk.splitlist(event.data)
-        for file in files:
-            if "youtube.com" in file or "youtu.be" in file:
-                self.url_entry.delete(0, tk.END)
-                self.url_entry.insert(0, file)
-                self.add_url()
+        try:
+            files = self.tk.splitlist(event.data)
+            for file in files:
+                clean_file = file.strip('{}').strip()
+                if "youtube.com" in clean_file or "youtu.be" in clean_file:
+                    self.url_entry.delete(0, tk.END)
+                    self.url_entry.insert(0, clean_file)
+                    self.add_url()
+        except Exception as e:
+            print(f"Drop error: {e}")
     
     def start_download(self):
         """Start downloading videos"""
@@ -474,7 +481,7 @@ class YTPremiereDownloader(ctk.CTk, TkinterDnD.DnDWrapper):
                 # Update job
                 if "title" in update:
                     job.title = update["title"]
-                    job.title_label.configure(text=job.title)
+                    job.title_label.configure(text=job.title[:100])
                 
                 if "status" in update:
                     job.status = update["status"]
@@ -552,5 +559,10 @@ class YTPremiereDownloader(ctk.CTk, TkinterDnD.DnDWrapper):
 
 
 if __name__ == "__main__":
+    print("=" * 60)
+    print("YouTube to Premiere Pro Downloader")
+    print("=" * 60)
+    print("IMPORTANT: Make sure Chrome browser is CLOSED!")
+    print("=" * 60)
     app = YTPremiereDownloader()
     app.mainloop()

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import queue
 import time
+import hashlib
 
 
 class VideoJob:
@@ -24,6 +25,7 @@ class VideoJob:
         self.progress = 0
         self.thumbnail = None
         self.video_info = None
+        self.video_id = None  # Will be set during fetch or download
         
         # UI references (set by main.py)
         self.ui_frame = None
@@ -42,7 +44,6 @@ class DownloaderEngine:
         self.retry_attempts = 2
         
         # Anti-Bot & Cookie Configuration
-        # YouTube 403 ve Login hatalarını aşmak için Tarayıcı Çerezlerini kullanır.
         self.common_opts = {
             'quiet': True,
             'no_warnings': True,
@@ -50,14 +51,8 @@ class DownloaderEngine:
             'ignoreerrors': False,
             'logtostderr': False,
             
-            # KRİTİK AYAR: Tarayıcı Çerezlerini Kullan
-            # Bu ayar, bilgisayarındaki Chrome tarayıcısından YouTube oturumunu çeker.
-            # Eğer Firefox kullanıyorsan 'chrome' yerine 'firefox' yazabilirsin.
-            # Safari desteklenmez (yetki sorunları yüzünden).
-            'cookiesfrombrowser': ('chrome',), 
-            
-            # Format seçiciyi esnek tutuyoruz
-            'format_sort': ['res:2160', 'res:1440', 'res:1080', 'res:720', 'codec:h264', 'ext:mp4:m4a'],
+            # CRITICAL: Use Browser Cookies
+            'cookiesfrombrowser': ('chrome',),
         }
     
     def check_ffmpeg(self) -> bool:
@@ -81,36 +76,80 @@ class DownloaderEngine:
             return None
     
     def fetch_video_info(self, job: VideoJob, update_queue: queue.Queue):
-        """Fetch video metadata"""
+        """
+        Fetch video metadata using Android client (bypasses JS challenges)
+        """
         try:
             ydl_opts = self.common_opts.copy()
-            # Playlist/Mix indirirken extract_flat True olmalı ki hızlıca listeyi çeksin
-            ydl_opts.update({'extract_flat': True})
+            ydl_opts.update({
+                'extract_flat': False,
+                'skip_download': True,
+                # CRITICAL: Force Android client - no JavaScript needed!
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['android'],
+                        'skip': ['hls', 'dash'],
+                    }
+                },
+            })
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(job.url, download=False)
                 
-                # Eğer bir playlist/mix ise ve 'entries' varsa, ilk videonun bilgisini alalım
-                if 'entries' in info:
-                    first_video = list(info['entries'])[0]
-                    job.title = f"Mix: {info.get('title', 'Unknown')} (Downloading...)"
-                    # Mix olduğu için thumbnail ilk videonun thumbnaili olabilir
-                    job.thumbnail = None 
+                # Handle playlists/mixes
+                if 'entries' in info and info['entries']:
+                    # For playlists, show first video info
+                    first_entry = info['entries'][0]
+                    job.video_info = first_entry
+                    job.video_id = first_entry.get('id', hashlib.md5(job.url.encode()).hexdigest()[:8])
+                    job.title = f"Mix: {first_entry.get('title', 'Unknown')} (+{len(info['entries'])-1} more)"
                 else:
+                    # Single video
                     job.video_info = info
+                    job.video_id = info.get('id', hashlib.md5(job.url.encode()).hexdigest()[:8])
                     job.title = info.get('title', 'Unknown Title')
-                    job.thumbnail = info.get('thumbnail')
+                
+                job.thumbnail = job.video_info.get('thumbnail')
                 
                 update_queue.put({
                     'url': job.url,
                     'title': job.title,
                     'thumbnail': job.thumbnail
                 })
+                
         except Exception as e:
             error_msg = str(e)
-            print(f"Fetch Error: {error_msg}") # Terminalde hatayı gör
+            print(f"Fetch Error: {error_msg}")
+            
+            # Provide helpful error messages
             if "cookie" in error_msg.lower():
-                error_msg = "Cookie Error: Close Chrome & Try Again."
+                error_msg = "Cookie Error: Close Chrome completely & restart app"
+            elif "403" in error_msg:
+                error_msg = "YouTube blocked request. Close Chrome & try again."
+            elif "login" in error_msg.lower():
+                error_msg = "Login required. Make sure you're logged into YouTube in Chrome."
+            elif "format" in error_msg.lower():
+                # Format error - try to list available formats for debugging
+                print(f"\n{'='*60}")
+                print(f"FORMAT ERROR for URL: {job.url}")
+                print(f"{'='*60}")
+                try:
+                    # List available formats for this video
+                    list_opts = {'quiet': True, 'cookiesfrombrowser': ('chrome',)}
+                    with yt_dlp.YoutubeDL(list_opts) as ydl:
+                        info = ydl.extract_info(job.url, download=False)
+                        if 'formats' in info:
+                            print("\nAvailable formats:")
+                            for f in info['formats'][:10]:  # Show first 10
+                                print(f"  - {f.get('format_id', 'N/A')}: {f.get('format_note', 'N/A')} "
+                                      f"{f.get('ext', 'N/A')} {f.get('resolution', 'N/A')}")
+                except:
+                    pass
+                print(f"{'='*60}\n")
+                error_msg = "Format not available. Try 'Pass-through' mode instead."
+            
+            # Generate fallback ID from URL
+            job.video_id = hashlib.md5(job.url.encode()).hexdigest()[:8]
             
             update_queue.put({
                 'url': job.url,
@@ -128,7 +167,8 @@ class DownloaderEngine:
                     percent = (downloaded / total) * 100
                     job.progress = percent
                     update_queue.put({'url': job.url, 'status': 'downloading', 'progress': percent})
-            except: pass
+            except: 
+                pass
         elif d['status'] == 'finished':
             update_queue.put({'url': job.url, 'progress': 100})
     
@@ -138,6 +178,11 @@ class DownloaderEngine:
         completed = 0
         
         for job in jobs:
+            # Skip if fetch failed
+            if job.status == "failed":
+                completed += 1
+                continue
+            
             success = False
             for attempt in range(self.retry_attempts):
                 try:
@@ -148,20 +193,36 @@ class DownloaderEngine:
                     elif format_mode == "h264_cfr":
                         success = self.download_and_transcode_h264_cfr(job, resolution, output_dir, update_queue)
                     
-                    if success: break
+                    if success: 
+                        break
+                        
                 except Exception as e:
-                    print(f"Download Attempt {attempt+1} Error: {e}")
-                    # Eğer Chrome kilitliyse kullanıcıyı uyar
-                    if "cookie" in str(e).lower() and "locked" in str(e).lower():
-                        update_queue.put({'url': job.url, 'status': 'failed', 'error': "ERROR: Close Chrome browser completely!"})
-                        return # Stop everything if browser is locked
+                    error_str = str(e)
+                    print(f"Download Attempt {attempt+1} Error: {error_str}")
+                    
+                    # Check for browser lock
+                    if "cookie" in error_str.lower() and "locked" in error_str.lower():
+                        update_queue.put({
+                            'url': job.url, 
+                            'status': 'failed', 
+                            'error': "ERROR: Chrome browser is open! Close it completely and try again."
+                        })
+                        return  # Stop processing
                     
                     if attempt == self.retry_attempts - 1:
-                        update_queue.put({'url': job.url, 'status': 'failed', 'error': f"Failed: {str(e)[:100]}"})
+                        update_queue.put({
+                            'url': job.url, 
+                            'status': 'failed', 
+                            'error': f"Failed: {error_str[:100]}"
+                        })
             
             if success:
                 completed += 1
-                update_queue.put({'url': job.url, 'status': 'finished', 'total_progress': (completed / total_jobs) * 100})
+                update_queue.put({
+                    'url': job.url, 
+                    'status': 'finished', 
+                    'total_progress': (completed / total_jobs) * 100
+                })
             else:
                 update_queue.put({'url': job.url, 'status': 'failed'})
         
@@ -169,19 +230,19 @@ class DownloaderEngine:
     
     def get_format_string(self, resolution: str) -> str:
         """
-        Daha esnek format seçimi.
-        Önce tam istenen çözünürlüğü dener, bulamazsa 'best'e düşer.
+        SIMPLIFIED format selection for 2025 YouTube
+        Using Android client compatibility mode
         """
-        if "4K" in resolution:
-            return "bestvideo[height<=2160]+bestaudio/bestvideo+bestaudio/best"
-        elif "1080p" in resolution:
-            return "bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/best"
-        else: # 720p
-            return "bestvideo[height<=720]+bestaudio/bestvideo+bestaudio/best"
+        # Just use 'best' - let yt-dlp handle the details
+        # The Android client extractor will provide the formats
+        return "best"
 
     def download_passthrough(self, job: VideoJob, resolution: str, output_dir: str, update_queue: queue.Queue) -> bool:
+        """Download without re-encoding using Android client"""
         try:
+            safe_id = job.video_id or hashlib.md5(job.url.encode()).hexdigest()[:8]
             output_template = os.path.join(output_dir, '%(title)s.%(ext)s')
+            
             ydl_opts = self.common_opts.copy()
             ydl_opts.update({
                 'format': self.get_format_string(resolution),
@@ -189,20 +250,35 @@ class DownloaderEngine:
                 'merge_output_format': 'mp4',
                 'postprocessors': [{'key': 'FFmpegMetadata', 'add_metadata': True}],
                 'progress_hooks': [lambda d: self.progress_hook(d, job, update_queue)],
-                'quiet': False 
+                'quiet': False,
+                'no_warnings': False,
+                # Use Android client for download too
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['android'],
+                        'skip': ['hls', 'dash'],
+                    }
+                },
             })
             
             update_queue.put({'url': job.url, 'status': 'downloading'})
+            
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([job.url])
+            
             return True
+            
         except Exception as e:
             print(f"Passthrough Error: {e}")
             raise e
     
     def download_and_transcode_h264_cfr(self, job: VideoJob, resolution: str, output_dir: str, update_queue: queue.Queue) -> bool:
+        """Download and transcode to H.264 CFR"""
         try:
-            temp_file = os.path.join(output_dir, f"temp_{job.video_info.get('id', 'video')}.%(ext)s")
+            # Use video_id for temp file
+            safe_id = job.video_id or hashlib.md5(job.url.encode()).hexdigest()[:8]
+            temp_file = os.path.join(output_dir, f"temp_{safe_id}.%(ext)s")
+            
             ydl_opts = self.common_opts.copy()
             ydl_opts.update({
                 'format': self.get_format_string(resolution),
@@ -213,53 +289,90 @@ class DownloaderEngine:
             })
             
             update_queue.put({'url': job.url, 'status': 'downloading'})
+            
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(job.url, download=True)
                 downloaded_file = ydl.prepare_filename(info)
             
+            # Transcode
             update_queue.put({'url': job.url, 'status': 'encoding', 'progress': 0})
-            output_file = os.path.join(output_dir, f"{self.sanitize_filename(job.title)}_CFR.mp4")
+            
+            safe_title = self.sanitize_filename(job.title)
+            output_file = os.path.join(output_dir, f"{safe_title}_CFR.mp4")
+            
             fps = self.detect_frame_rate(downloaded_file)
             ffmpeg_cmd = self.build_h264_cfr_command(downloaded_file, output_file, fps)
             
-            self.run_ffmpeg_with_progress(ffmpeg_cmd, job, update_queue, self.get_video_duration(downloaded_file))
-            if os.path.exists(downloaded_file): os.remove(downloaded_file)
+            self.run_ffmpeg_with_progress(
+                ffmpeg_cmd, job, update_queue, 
+                self.get_video_duration(downloaded_file)
+            )
+            
+            # Cleanup
+            if os.path.exists(downloaded_file):
+                os.remove(downloaded_file)
+            
             return True
+            
         except Exception as e:
             print(f"CFR Error: {e}")
             raise e
 
     def download_and_transcode_prores(self, job: VideoJob, resolution: str, output_dir: str, update_queue: queue.Queue) -> bool:
+        """Download and transcode to ProRes 422 using Android client"""
         try:
-            temp_file = os.path.join(output_dir, f"temp_{job.video_info.get('id', 'video')}.%(ext)s")
+            safe_id = job.video_id or hashlib.md5(job.url.encode()).hexdigest()[:8]
+            temp_file = os.path.join(output_dir, f"temp_{safe_id}.%(ext)s")
+            
             ydl_opts = self.common_opts.copy()
             ydl_opts.update({
                 'format': self.get_format_string(resolution),
                 'outtmpl': temp_file,
                 'merge_output_format': 'mkv',
                 'progress_hooks': [lambda d: self.progress_hook(d, job, update_queue)],
-                'quiet': False
+                'quiet': False,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['android'],
+                        'skip': ['hls', 'dash'],
+                    }
+                },
             })
             
             update_queue.put({'url': job.url, 'status': 'downloading'})
+            
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(job.url, download=True)
                 downloaded_file = ydl.prepare_filename(info)
             
+            # Transcode
             update_queue.put({'url': job.url, 'status': 'encoding', 'progress': 0})
-            output_file = os.path.join(output_dir, f"{self.sanitize_filename(job.title)}_ProRes.mov")
+            
+            safe_title = self.sanitize_filename(job.title)
+            output_file = os.path.join(output_dir, f"{safe_title}_ProRes.mov")
+            
             fps = self.detect_frame_rate(downloaded_file)
             ffmpeg_cmd = self.build_prores_command(downloaded_file, output_file, fps)
             
-            self.run_ffmpeg_with_progress(ffmpeg_cmd, job, update_queue, self.get_video_duration(downloaded_file))
-            if os.path.exists(downloaded_file): os.remove(downloaded_file)
+            self.run_ffmpeg_with_progress(
+                ffmpeg_cmd, job, update_queue, 
+                self.get_video_duration(downloaded_file)
+            )
+            
+            # Cleanup
+            if os.path.exists(downloaded_file):
+                os.remove(downloaded_file)
+            
             return True
+            
         except Exception as e:
             print(f"ProRes Error: {e}")
             raise e
 
     def build_h264_cfr_command(self, input_file: str, output_file: str, fps: float) -> List[str]:
+        """Build FFmpeg command for H.264 CFR encoding"""
         cmd = ["ffmpeg", "-i", input_file]
+        
         if self.hw_encoder == "nvenc":
             cmd.extend(["-c:v", "h264_nvenc", "-preset", "slow", "-cq", "18", "-r", str(fps)])
         elif self.hw_encoder == "videotoolbox":
@@ -268,49 +381,88 @@ class DownloaderEngine:
             cmd.extend(["-c:v", "h264_qsv", "-preset", "slow", "-global_quality", "18", "-r", str(fps)])
         else:
             cmd.extend(["-c:v", "libx264", "-preset", "slow", "-crf", "18", "-r", str(fps)])
-        cmd.extend(["-c:a", "aac", "-b:a", "320k", "-ar", "48000", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-y", output_file])
+        
+        cmd.extend([
+            "-c:a", "aac", "-b:a", "320k", "-ar", "48000",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", 
+            "-y", output_file
+        ])
         return cmd
     
     def build_prores_command(self, input_file: str, output_file: str, fps: float) -> List[str]:
-        return ["ffmpeg", "-i", input_file, "-c:v", "prores_ks", "-profile:v", "2", "-vendor", "apl0", 
-                "-pix_fmt", "yuv422p10le", "-r", str(fps), "-c:a", "pcm_s16le", "-ar", "48000", "-y", output_file]
+        """Build FFmpeg command for ProRes 422 encoding"""
+        return [
+            "ffmpeg", "-i", input_file,
+            "-c:v", "prores_ks", "-profile:v", "2", "-vendor", "apl0",
+            "-pix_fmt", "yuv422p10le", "-r", str(fps),
+            "-c:a", "pcm_s16le", "-ar", "48000",
+            "-y", output_file
+        ]
     
     def detect_frame_rate(self, video_file: str) -> float:
+        """Detect video frame rate using FFprobe"""
         try:
-            cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", 
-                   "-of", "default=noprint_wrappers=1:nokey=1", video_file]
+            cmd = [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=r_frame_rate",
+                "-of", "default=noprint_wrappers=1:nokey=1", video_file
+            ]
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             fps_str = result.stdout.strip()
+            
             if '/' in fps_str:
                 num, den = map(int, fps_str.split('/'))
                 fps = num / den
             else:
                 fps = float(fps_str)
+            
+            # Round to common frame rates
             if 23 < fps < 25: return 24
             elif 24 < fps < 26: return 25
             elif 29 < fps < 31: return 30
             elif 59 < fps < 61: return 60
             else: return round(fps)
-        except: return 30
+        except:
+            return 30  # Fallback
     
     def get_video_duration(self, video_file: str) -> float:
+        """Get video duration in seconds"""
         try:
-            cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", video_file]
+            cmd = [
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", video_file
+            ]
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             return float(result.stdout.strip())
-        except: return 0
+        except:
+            return 0
     
     def run_ffmpeg_with_progress(self, cmd: List[str], job: VideoJob, update_queue: queue.Queue, duration: float):
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1)
+        """Run FFmpeg and parse progress"""
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True, bufsize=1
+        )
+        
         time_pattern = re.compile(r'time=(\d+):(\d+):(\d+\.\d+)')
+        
         for line in process.stdout:
             match = time_pattern.search(line)
             if match and duration > 0:
                 h, m, s = match.groups()
                 current = int(h) * 3600 + int(m) * 60 + float(s)
-                update_queue.put({'url': job.url, 'progress': min((current / duration) * 100, 99)})
+                progress = min((current / duration) * 100, 99)
+                update_queue.put({'url': job.url, 'progress': progress})
+        
         process.wait()
-        if process.returncode != 0: raise Exception("FFmpeg encoding failed")
+        if process.returncode != 0:
+            raise Exception("FFmpeg encoding failed")
     
     def sanitize_filename(self, filename: str) -> str:
-        return re.sub(r'[<>:"/\\|?*]', '', filename)[:200]
+        """Remove invalid characters from filename"""
+        # Remove invalid characters
+        filename = re.sub(r'[<>:"/\\|?*]', '', filename)
+        # Remove leading/trailing spaces and dots
+        filename = filename.strip('. ')
+        # Limit length
+        return filename[:200] if filename else "video"
