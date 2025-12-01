@@ -1,7 +1,7 @@
 """
 YouTube to Premiere Pro Downloader - Core Engine
 Handles all download, transcoding, and hardware acceleration logic.
-Updated for 2025 YouTube Bot Protection bypass with OAuth2.
+Updated for 2025 YouTube Bot Protection bypass with Browser Cookies.
 """
 
 import yt_dlp
@@ -41,18 +41,22 @@ class DownloaderEngine:
         self.hw_encoder = self.detect_hardware_encoder()
         self.retry_attempts = 2
         
-        # Anti-Bot & OAuth2 Configuration
-        # Bu ayarlar YouTube'un 'Format Yok' hatasını aşmak için OAuth2 kullanır.
+        # Anti-Bot & Cookie Configuration
+        # YouTube 403 ve Login hatalarını aşmak için Tarayıcı Çerezlerini kullanır.
         self.common_opts = {
             'quiet': True,
             'no_warnings': True,
             'nocheckcertificate': False,
             'ignoreerrors': False,
             'logtostderr': False,
-            # OAuth2 Kimlik Doğrulama (Bot Korumasını Aşmak İçin En Garantili Yol)
-            'username': 'oauth2',
-            'password': '',
-            # Format seçiciyi daha esnek hale getirdik
+            
+            # KRİTİK AYAR: Tarayıcı Çerezlerini Kullan
+            # Bu ayar, bilgisayarındaki Chrome tarayıcısından YouTube oturumunu çeker.
+            # Eğer Firefox kullanıyorsan 'chrome' yerine 'firefox' yazabilirsin.
+            # Safari desteklenmez (yetki sorunları yüzünden).
+            'cookiesfrombrowser': ('chrome',), 
+            
+            # Format seçiciyi esnek tutuyoruz
             'format_sort': ['res:2160', 'res:1440', 'res:1080', 'res:720', 'codec:h264', 'ext:mp4:m4a'],
         }
     
@@ -80,14 +84,22 @@ class DownloaderEngine:
         """Fetch video metadata"""
         try:
             ydl_opts = self.common_opts.copy()
-            # extract_flat kapalı çünkü formatları erkenden kontrol etmek istiyoruz
+            # Playlist/Mix indirirken extract_flat True olmalı ki hızlıca listeyi çeksin
             ydl_opts.update({'extract_flat': True})
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(job.url, download=False)
-                job.video_info = info
-                job.title = info.get('title', 'Unknown Title')
-                job.thumbnail = info.get('thumbnail')
+                
+                # Eğer bir playlist/mix ise ve 'entries' varsa, ilk videonun bilgisini alalım
+                if 'entries' in info:
+                    first_video = list(info['entries'])[0]
+                    job.title = f"Mix: {info.get('title', 'Unknown')} (Downloading...)"
+                    # Mix olduğu için thumbnail ilk videonun thumbnaili olabilir
+                    job.thumbnail = None 
+                else:
+                    job.video_info = info
+                    job.title = info.get('title', 'Unknown Title')
+                    job.thumbnail = info.get('thumbnail')
                 
                 update_queue.put({
                     'url': job.url,
@@ -97,8 +109,8 @@ class DownloaderEngine:
         except Exception as e:
             error_msg = str(e)
             print(f"Fetch Error: {error_msg}") # Terminalde hatayı gör
-            if "Requested format is not available" in error_msg:
-                error_msg = "Format Error: Update yt-dlp or Authenticate via Terminal."
+            if "cookie" in error_msg.lower():
+                error_msg = "Cookie Error: Close Chrome & Try Again."
             
             update_queue.put({
                 'url': job.url,
@@ -139,6 +151,11 @@ class DownloaderEngine:
                     if success: break
                 except Exception as e:
                     print(f"Download Attempt {attempt+1} Error: {e}")
+                    # Eğer Chrome kilitliyse kullanıcıyı uyar
+                    if "cookie" in str(e).lower() and "locked" in str(e).lower():
+                        update_queue.put({'url': job.url, 'status': 'failed', 'error': "ERROR: Close Chrome browser completely!"})
+                        return # Stop everything if browser is locked
+                    
                     if attempt == self.retry_attempts - 1:
                         update_queue.put({'url': job.url, 'status': 'failed', 'error': f"Failed: {str(e)[:100]}"})
             
@@ -172,7 +189,7 @@ class DownloaderEngine:
                 'merge_output_format': 'mp4',
                 'postprocessors': [{'key': 'FFmpegMetadata', 'add_metadata': True}],
                 'progress_hooks': [lambda d: self.progress_hook(d, job, update_queue)],
-                'quiet': False # Terminalde authentication kodunu görmek için
+                'quiet': False 
             })
             
             update_queue.put({'url': job.url, 'status': 'downloading'})
@@ -185,7 +202,7 @@ class DownloaderEngine:
     
     def download_and_transcode_h264_cfr(self, job: VideoJob, resolution: str, output_dir: str, update_queue: queue.Queue) -> bool:
         try:
-            temp_file = os.path.join(output_dir, f"temp_{job.video_info['id']}.%(ext)s")
+            temp_file = os.path.join(output_dir, f"temp_{job.video_info.get('id', 'video')}.%(ext)s")
             ydl_opts = self.common_opts.copy()
             ydl_opts.update({
                 'format': self.get_format_string(resolution),
@@ -214,7 +231,7 @@ class DownloaderEngine:
 
     def download_and_transcode_prores(self, job: VideoJob, resolution: str, output_dir: str, update_queue: queue.Queue) -> bool:
         try:
-            temp_file = os.path.join(output_dir, f"temp_{job.video_info['id']}.%(ext)s")
+            temp_file = os.path.join(output_dir, f"temp_{job.video_info.get('id', 'video')}.%(ext)s")
             ydl_opts = self.common_opts.copy()
             ydl_opts.update({
                 'format': self.get_format_string(resolution),
